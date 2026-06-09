@@ -9,20 +9,13 @@ import com.hivemc.chunker.cli.messenger.messaging.response.ErrorResponse;
 import com.hivemc.chunker.cli.messenger.messaging.response.OutputResponse;
 import com.hivemc.chunker.cli.messenger.messaging.response.ProgressResponse;
 import com.hivemc.chunker.cli.messenger.messaging.response.ProgressStateResponse;
-import com.hivemc.chunker.cli.messenger.messaging.response.TileErrorResponse;
-import com.hivemc.chunker.cli.messenger.messaging.response.TileReadyResponse;
 import com.hivemc.chunker.conversion.WorldConverter;
 import com.hivemc.chunker.conversion.encoding.EncodingType;
 import com.hivemc.chunker.conversion.encoding.base.Converter;
 import com.hivemc.chunker.conversion.encoding.base.Version;
 import com.hivemc.chunker.conversion.encoding.base.reader.LevelReader;
 import com.hivemc.chunker.conversion.encoding.base.writer.LevelWriter;
-import com.hivemc.chunker.conversion.encoding.preview.ChunkerWorldRegionRgbaSource;
-import com.hivemc.chunker.conversion.encoding.preview.PreviewMapBin;
-import com.hivemc.chunker.conversion.encoding.preview.PreviewMetadataReader;
-import com.hivemc.chunker.conversion.encoding.preview.PreviewTileCache;
-import com.hivemc.chunker.conversion.encoding.preview.PreviewTileService;
-import com.hivemc.chunker.conversion.encoding.preview.RegionRgbaSource;
+import com.hivemc.chunker.conversion.encoding.preview.PreviewLevelWriter;
 import com.hivemc.chunker.conversion.encoding.settings.SettingsLevelWriter;
 import com.hivemc.chunker.conversion.intermediate.column.biome.ChunkerBiome;
 import com.hivemc.chunker.conversion.intermediate.column.biome.ChunkerCustomBiome;
@@ -48,14 +41,13 @@ import java.util.*;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Messenger handles JSON communication between ChunkerWeb and itself through System.out.
  */
 public class Messenger {
     private static final Map<UUID, Map<UUID, WorldConverter>> SESSION_ID_TO_WORLD_CONVERTERS = new Object2ObjectOpenHashMap<>();
-    private static final Map<UUID, PreviewTileService> SESSION_ID_TO_PREVIEW_SERVICE = new ConcurrentHashMap<>();
+    private static final File BIOMES_DUMMY_DIR = new File(".");
     private static final Gson GSON = new GsonBuilder()
             .registerTypeHierarchyAdapter(BasicMessage.class, new BasicMessageTypeAdapter())
             .create();
@@ -138,78 +130,52 @@ public class Messenger {
                     }
                     case PREVIEW -> {
                         PreviewRequest previewRequest = (PreviewRequest) message;
-                        UUID anonymousId = previewRequest.getAnonymousId();
-                        UUID requestId = previewRequest.getRequestId();
-                        File inputDir = new File(previewRequest.getInputPath());
-                        File outputDir = new File(previewRequest.getOutputPath());
+                        WorldConverter worldConverter = createWorldConverter(previewRequest.getAnonymousId(), previewRequest.getRequestId());
+                        boolean started = startConversionRequest(
+                                previewRequest.getAnonymousId(),
+                                previewRequest.getRequestId(),
+                                worldConverter,
+                                new File(previewRequest.getInputPath()),
+                                new PreviewLevelWriter(new File(previewRequest.getOutputPath()))
+                        );
 
-                        // Immediately signal that we have started — moves the renderer off the queue screen.
-                        write(new ProgressResponse(requestId, 0.0));
+                        worldConverter.setDimensionMapping(previewRequest.getInputToOutputDimension());
 
-                        // Run the metadata pass + tile service init off the messenger thread so the main loop stays responsive.
-                        CompletableFuture.runAsync(() -> {
-                            try {
-                                // 1) Run the metadata pass. Choose Bedrock vs Java by what's in the world directory.
-                                PreviewMetadataReader metadataReader = new PreviewMetadataReader();
-                                if (new File(inputDir, "db/CURRENT").isFile()) {
-                                    metadataReader.readBedrockWorld(inputDir, outputDir);
-                                } else {
-                                    metadataReader.readJavaWorld(inputDir, outputDir);
-                                }
+                        // Turn the String identifiers into a Dimension based map
+                        if (previewRequest.getPruningList() != null && previewRequest.getPruningList().getConfigs() != null && !previewRequest.getPruningList().getConfigs().isEmpty()) {
+                            DimensionRegistry registry = worldConverter.getDimensionRegistry();
+                            Map<String, PruningConfig> pruning = previewRequest.getPruningList().getConfigs();
 
-                                // Coarse progress signal halfway through.
-                                write(new ProgressResponse(requestId, 0.5));
-
-                                // 2) Spin up the long-lived tile service for this session.
-                                PreviewMapBin mapBin = PreviewMapBin.read(new File(outputDir, "map.bin"));
-                                RegionRgbaSource source = new ChunkerWorldRegionRgbaSource(inputDir);
-                                int cacheEntries = PreviewTileCache.computeCapacityEntries(Runtime.getRuntime().maxMemory());
-                                int workers = Math.min(4, Math.max(1, Runtime.getRuntime().availableProcessors() / 2));
-                                PreviewTileService service = new PreviewTileService(outputDir, mapBin, source, new PreviewTileCache(cacheEntries), workers);
-                                service.setEventListener(new PreviewTileService.EventListener() {
-                                    @Override public void onTileReady(TileReadyResponse r) { write(r); }
-                                    @Override public void onTileError(TileErrorResponse r) { write(r); }
-                                });
-
-                                // Stop and replace any pre-existing service for this session.
-                                PreviewTileService previous = SESSION_ID_TO_PREVIEW_SERVICE.put(anonymousId, service);
-                                if (previous != null) previous.shutdown();
-
-                                // 3) Tell the client we're done with the metadata pass.
-                                write(new OutputResponse(requestId, null));
-                            } catch (Throwable t) {
-                                // Use Throwable: catches any unexpected runtime issue including OOMs, so we always
-                                // surface an error to the client instead of leaving it stuck on the progress screen.
-                                write(new ErrorResponse(
-                                        requestId,
-                                        false,
-                                        "Failed to start preview.",
-                                        null,
-                                        t.getMessage(),
-                                        printStackTrace(t)
-                                ));
+                            Map<Dimension, PruningConfig> pruningConfigs = new Object2ObjectOpenHashMap<>(pruning.size());
+                            for (String key : pruning.keySet()) {
+                                pruningConfigs.put(registry.getByIdentifier(key), pruning.get(key));
                             }
-                        });
-                    }
-                    case REQUEST_PREVIEW_TILES -> {
-                        RequestPreviewTilesRequest req = (RequestPreviewTilesRequest) message;
-                        PreviewTileService svc = SESSION_ID_TO_PREVIEW_SERVICE.get(req.getAnonymousId());
-                        if (svc == null) {
-                            write(new ErrorResponse(req.getRequestId(), false,
-                                    "No active preview session.", null, null, null));
-                        } else {
-                            svc.enqueueRange(req.getWorld(), req.getLod(),
-                                    req.getMinTx(), req.getMinTz(), req.getMaxTx(), req.getMaxTz());
-                            write(new OutputResponse(req.getRequestId(), null));
+
+                            worldConverter.setPruningConfigs(pruningConfigs);
                         }
-                    }
-                    case CANCEL_PREVIEW_TILES -> {
-                        CancelPreviewTilesRequest req = (CancelPreviewTilesRequest) message;
-                        PreviewTileService svc = SESSION_ID_TO_PREVIEW_SERVICE.get(req.getAnonymousId());
-                        if (svc != null) {
-                            svc.cancel(req.getWorld(), req.getLod());
+
+                        // Turn off certain features for preview
+                        worldConverter.setProcessMaps(false);
+                        worldConverter.setProcessLighting(false);
+                        worldConverter.setProcessHeightMap(false);
+                        worldConverter.setProcessBlockEntities(false);
+                        worldConverter.setProcessColumnPreTransform(false);
+                        worldConverter.setProcessEntities(false);
+                        worldConverter.setProcessBiomes(false);
+                        worldConverter.setProcessItems(false);
+
+                        // Write an error if it failed to start
+                        if (!started) {
+                            removeWorldConverter(previewRequest.getAnonymousId(), previewRequest.getRequestId());
+                            write(new ErrorResponse(
+                                    previewRequest.getRequestId(),
+                                    false,
+                                    "Failed to start preview.",
+                                    null,
+                                    null,
+                                    null
+                            ));
                         }
-                        write(new OutputResponse(req.getRequestId(), null));
                     }
                     case CONVERT -> {
                         ConvertRequest convertRequest = (ConvertRequest) message;
@@ -392,12 +358,15 @@ public class Messenger {
                             }
                         }
                     }
+                    case BIOMES -> {
+                        BiomesRequest biomesRequest = (BiomesRequest) message;
+                        JsonObject response = new JsonObject();
+                        response.add("input", getBiomesForInput(biomesRequest.getInputPath()));
+                        response.add("output", getBiomesForOutput(biomesRequest.getOutputType()));
+                        write(new OutputResponse(biomesRequest.getRequestId(), response));
+                    }
                     case KILL -> {
                         KillRequest killRequest = (KillRequest) message;
-
-                        // Shutdown any preview tile service for this session.
-                        PreviewTileService previewService = SESSION_ID_TO_PREVIEW_SERVICE.remove(killRequest.getAnonymousId());
-                        if (previewService != null) previewService.shutdown();
 
                         // Loop through all the converters under this anonymous ID and cancel them
                         Map<UUID, WorldConverter> converters = SESSION_ID_TO_WORLD_CONVERTERS.get(killRequest.getAnonymousId());
@@ -504,6 +473,62 @@ public class Messenger {
             e.printStackTrace();
             return Optional.empty(); // Unable to make writer
         }
+    }
+
+    /**
+     * Get the supported biome identifiers for an input world.
+     *
+     * @param inputPath the path to the input world.
+     * @return a JSON array of biome name strings, or empty if the format couldn't be detected.
+     */
+    public static JsonArray getBiomesForInput(String inputPath) {
+        // Construct a reader for the input world
+        WorldConverter worldConverter = new WorldConverter(UUID.randomUUID());
+        Optional<? extends LevelReader> reader = EncodingType.findReader(new File(inputPath), worldConverter);
+        if (reader.isEmpty()) return new JsonArray();
+
+        // Collect the supported biome identifiers
+        boolean bedrock = reader.get().getEncodingType() == EncodingType.BEDROCK;
+        Set<ChunkerBiome.ChunkerVanillaBiome> supportedBiomes = reader.get().getSupportedBiomes();
+        JsonArray result = new JsonArray(supportedBiomes.size());
+        for (ChunkerBiome.ChunkerVanillaBiome biome : supportedBiomes) {
+            Optional<String> identifier;
+            if (bedrock) {
+                identifier = biome.getBedrockIdentifier();
+            } else {
+                identifier = biome.getJavaIdentifier();
+            }
+            identifier.ifPresent(result::add);
+        }
+        return result;
+    }
+
+    /**
+     * Get the supported biome identifiers for an output format ID.
+     *
+     * @param id the encoded output format ID.
+     * @return a JSON array of biome name strings, or empty if the format is unknown.
+     */
+    public static JsonArray getBiomesForOutput(String id) {
+        // Construct a writer for the output format
+        WorldConverter worldConverter = new WorldConverter(UUID.randomUUID());
+        Optional<? extends LevelWriter> writer = findWriter(id, worldConverter, BIOMES_DUMMY_DIR);
+        if (writer.isEmpty()) return new JsonArray();
+
+        // Collect the supported biome identifiers
+        boolean bedrock = writer.get().getEncodingType() == EncodingType.BEDROCK;
+        Set<ChunkerBiome.ChunkerVanillaBiome> supportedBiomes = writer.get().getSupportedBiomes();
+        JsonArray result = new JsonArray(supportedBiomes.size());
+        for (ChunkerBiome.ChunkerVanillaBiome biome : supportedBiomes) {
+            Optional<String> identifier;
+            if (bedrock) {
+                identifier = biome.getBedrockIdentifier();
+            } else {
+                identifier = biome.getJavaIdentifier();
+            }
+            identifier.ifPresent(result::add);
+        }
+        return result;
     }
 
     /**
